@@ -588,3 +588,4 @@ if __name__ == '__main__':
         logger.error(f"❌ Missing dependency: {e}")
         logger.error("Install: pip install python-telegram-bot[job-queue]==20.7 aiohttp")
         exit(1)
+
