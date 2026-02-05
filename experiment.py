@@ -15,7 +15,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # ========== CONFIGURATION ==========
 # Get your bot token from environment variable (SAFE WAY)
-BOT_TOKEN = os.getenv("8561803442:AAF6DwuG_kNZMa_y132KTc_Pbg1FNrSWrxI")  # Set this in your system or Railway/Heroku
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Set this in your system or Railway/Heroku
 
 # Enable logging
 logging.basicConfig(
@@ -385,4 +385,5 @@ if __name__ == '__main__':
         # Close downloader session
         asyncio.run(downloader.close_session())
     finally:
+
         logger.info("Bot shutdown complete")
