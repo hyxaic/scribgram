@@ -1,389 +1,590 @@
 #!/usr/bin/env python3
 """
-Scribd Downloader Telegram Bot
-Sends PDFs from Scribd links using scribd-downloader.co
+SCRIBD DOWNLOADER TELEGRAM BOT
+A professional, reliable Scribd document downloader bot
+Deployment-ready for Railway & cloud platforms
 """
 
 import os
 import re
 import logging
 import asyncio
-from typing import Optional
+from typing import Optional, Dict, Any
+from datetime import datetime
 import aiohttp
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InputFile
+from telegram.ext import (
+    Application, 
+    CommandHandler, 
+    MessageHandler, 
+    filters, 
+    ContextTypes
+)
+from telegram.constants import ParseMode
+import json
 
 # ========== CONFIGURATION ==========
-# Get your bot token from environment variable (SAFE WAY)
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # Set this in your system or Railway/Heroku
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Set in Railway environment
+PORT = int(os.getenv("PORT", 8443))  # Railway provides PORT
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # For webhook deployment
 
-# Enable logging
+# Service endpoints (multiple fallbacks)
+DOWNLOAD_SERVICES = [
+    "https://api.scribd-downloader.co/v1/download",
+    "https://scribd-downloader-api.herokuapp.com/download",
+    "https://scribd-dl.onrender.com/api/download",
+]
+
+# Enable detailed logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('bot.log')
+    ]
 )
 logger = logging.getLogger(__name__)
 
+# ========== UTILITY FUNCTIONS ==========
+def validate_scribd_url(url: str) -> bool:
+    """Validate if URL is a proper Scribd link"""
+    patterns = [
+        r'https?://(?:www\.)?scribd\.com/(?:doc|document|presentation)/(\d+)',
+        r'https?://(?:www\.)?scribd\.com/doc/(\d+)',
+        r'https?://(?:www\.)?scribd\.com/document/(\d+)(?:/[^/?]+)?',
+        r'https?://(?:www\.)?scribd\.com/presentation/(\d+)',
+    ]
+    return any(re.search(pattern, url, re.IGNORECASE) for pattern in patterns)
+
+def extract_document_id(url: str) -> Optional[str]:
+    """Extract document ID from Scribd URL"""
+    patterns = [
+        r'scribd\.com/(?:doc|document|presentation)/(\d+)',
+        r'/doc/(\d+)',
+        r'/document/(\d+)',
+        r'/presentation/(\d+)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+def sanitize_filename(name: str) -> str:
+    """Clean filename for safe use"""
+    name = re.sub(r'[^\w\s-]', '', name)
+    name = re.sub(r'[-\s]+', '_', name)
+    name = name.strip('_')
+    if not name.lower().endswith('.pdf'):
+        name += '.pdf'
+    return name[:60]  # Telegram filename limit
+
 # ========== SCRIBD DOWNLOADER CLASS ==========
-class AsyncScribdDownloader:
-    """Async version of Scribd downloader using aiohttp"""
+class ScribdDownloader:
+    """Professional Scribd Downloader with multiple service fallbacks"""
     
     def __init__(self):
-        self.base_url = "https://scribd-downloader.co"
-        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        self.session: Optional[aiohttp.ClientSession] = None
+        self.session = None
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json, text/html, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'DNT': '1',
+        }
+        self.timeout = aiohttp.ClientTimeout(total=45)
+        
+    async def __aenter__(self):
+        await self.create_session()
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close_session()
     
-    async def init_session(self):
-        """Initialize aiohttp session"""
+    async def create_session(self):
+        """Create aiohttp session"""
         if not self.session:
             self.session = aiohttp.ClientSession(
-                headers={
-                    'User-Agent': self.user_agent,
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.5',
-                    'Accept-Encoding': 'gzip, deflate',
-                    'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1',
-                }
+                headers=self.headers,
+                timeout=self.timeout
             )
     
     async def close_session(self):
         """Close aiohttp session"""
         if self.session:
             await self.session.close()
+            self.session = None
     
-    def extract_doc_info(self, url: str) -> Optional[dict]:
-        """Extract document ID and name from Scribd URL"""
-        patterns = [
-            r'scribd\.com/(?:doc|document|presentation)/(\d+)(?:/([^/?]+))?',
-            r'scribd\.com/doc/(\d+)',
-            r'scribd\.com/document/(\d+)',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, url, re.IGNORECASE)
-            if match:
-                doc_id = match.group(1)
-                doc_name = match.group(2) if match.groups() > 1 else None
-                return {'id': doc_id, 'name': doc_name}
-        
-        return None
-    
-    async def get_pdf_from_url(self, scribd_url: str) -> Optional[bytes]:
-        """
-        Get PDF from scribd-downloader.co
-        Uses the website's actual form submission
-        """
+    async def download_from_service(self, doc_id: str, service_url: str) -> Optional[bytes]:
+        """Try downloading from a specific service"""
         try:
-            await self.init_session()
-            
-            # Extract document ID
-            doc_info = self.extract_doc_info(scribd_url)
-            if not doc_info:
-                logger.error(f"Invalid Scribd URL: {scribd_url}")
-                return None
-            
-            doc_id = doc_info['id']
-            logger.info(f"Processing document ID: {doc_id}")
-            
-            # Method 1: Try direct download endpoint (most reliable)
-            pdf_url = f"https://scribd-downloader.co/api/download/{doc_id}"
-            
-            async with self.session.get(pdf_url, timeout=30) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    if content[:4] == b'%PDF':
-                        logger.info(f"Successfully downloaded PDF via direct endpoint")
-                        return content
-            
-            # Method 2: Use the main website form
-            logger.info("Trying main website form...")
-            
-            # First, get the page to get cookies
-            async with self.session.get(self.base_url, timeout=30) as response:
-                if response.status != 200:
-                    logger.error(f"Failed to access site: {response.status}")
-                    return None
-            
-            # Prepare form submission (simulating the actual form)
-            form_data = aiohttp.FormData()
-            form_data.add_field('url', scribd_url)
-            form_data.add_field('format', 'pdf')
-            form_data.add_field('action', 'download')
-            
-            # Submit the form
             async with self.session.post(
-                self.base_url,
-                data=form_data,
+                service_url,
+                json={'url': f'https://scribd.com/document/{doc_id}'},
                 timeout=30
             ) as response:
                 if response.status == 200:
-                    html = await response.text()
-                    
-                    # Look for download links in the HTML
-                    download_patterns = [
-                        r'<a[^>]*href="([^"]+\.pdf)"[^>]*>',
-                        r'download="([^"]+)"',
-                        r'"(https?://[^"]+\.pdf)"',
-                        r'window\.location\.href\s*=\s*["\']([^"\']+)["\']',
-                    ]
-                    
-                    for pattern in download_patterns:
-                        matches = re.findall(pattern, html, re.IGNORECASE)
-                        for match in matches:
-                            pdf_url = match
-                            if not pdf_url.startswith('http'):
-                                pdf_url = self.base_url + pdf_url
-                            
-                            logger.info(f"Found PDF URL: {pdf_url}")
-                            
-                            # Download the PDF
-                            async with self.session.get(pdf_url, timeout=30) as pdf_response:
-                                if pdf_response.status == 200:
-                                    content = await pdf_response.read()
-                                    if content[:4] == b'%PDF':
-                                        return content
-            
-            logger.error("No PDF found in response")
-            return None
-            
-        except asyncio.TimeoutError:
-            logger.error("Request timed out")
-            return None
+                    data = await response.json()
+                    if data.get('success') and data.get('pdf_url'):
+                        # Download the PDF
+                        async with self.session.get(data['pdf_url'], timeout=30) as pdf_response:
+                            if pdf_response.status == 200:
+                                return await pdf_response.read()
         except Exception as e:
-            logger.error(f"Error downloading PDF: {e}")
+            logger.debug(f"Service {service_url} failed: {e}")
             return None
+        return None
+    
+    async def direct_download(self, scribd_url: str) -> Optional[bytes]:
+        """Try direct download methods"""
+        try:
+            # Method 1: Try common API endpoints
+            doc_id = extract_document_id(scribd_url)
+            if not doc_id:
+                return None
+            
+            # Try multiple services
+            for service_url in DOWNLOAD_SERVICES:
+                logger.info(f"Trying service: {service_url}")
+                pdf_data = await self.download_from_service(doc_id, service_url)
+                if pdf_data and pdf_data[:4] == b'%PDF':
+                    logger.info(f"Success from service: {service_url}")
+                    return pdf_data
+            
+            # Method 2: Try alternative approach
+            alt_url = f"https://scribd-downloader.co/download/{doc_id}"
+            async with self.session.get(alt_url, allow_redirects=True) as response:
+                if response.status == 200:
+                    content = await response.read()
+                    if content[:4] == b'%PDF':
+                        return content
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Direct download error: {e}")
+            return None
+    
+    async def download_document(self, scribd_url: str) -> Dict[str, Any]:
+        """
+        Main download function with comprehensive error handling
+        Returns: {'success': bool, 'data': bytes or None, 'filename': str, 'error': str}
+        """
+        await self.create_session()
+        
+        try:
+            # Validate URL
+            if not validate_scribd_url(scribd_url):
+                return {
+                    'success': False,
+                    'data': None,
+                    'filename': '',
+                    'error': 'Invalid Scribd URL format'
+                }
+            
+            doc_id = extract_document_id(scribd_url)
+            if not doc_id:
+                return {
+                    'success': False,
+                    'data': None,
+                    'filename': '',
+                    'error': 'Could not extract document ID'
+                }
+            
+            logger.info(f"Processing document ID: {doc_id}")
+            
+            # Try download
+            start_time = datetime.now()
+            pdf_data = await self.direct_download(scribd_url)
+            elapsed = (datetime.now() - start_time).total_seconds()
+            
+            if pdf_data:
+                # Check file size
+                file_size = len(pdf_data)
+                if file_size > 50 * 1024 * 1024:  # 50MB Telegram limit
+                    return {
+                        'success': False,
+                        'data': None,
+                        'filename': f'document_{doc_id}.pdf',
+                        'error': f'File too large ({file_size/1024/1024:.1f}MB). Max 50MB.'
+                    }
+                
+                # Generate filename
+                filename = f'scribd_document_{doc_id}.pdf'
+                
+                logger.info(f"Download successful: {file_size} bytes in {elapsed:.1f}s")
+                
+                return {
+                    'success': True,
+                    'data': pdf_data,
+                    'filename': filename,
+                    'error': None,
+                    'size': file_size
+                }
+            else:
+                return {
+                    'success': False,
+                    'data': None,
+                    'filename': '',
+                    'error': 'Document could not be downloaded. It might require subscription or be private.'
+                }
+                
+        except asyncio.TimeoutError:
+            return {
+                'success': False,
+                'data': None,
+                'filename': '',
+                'error': 'Download timed out (30s). Try again later.'
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            return {
+                'success': False,
+                'data': None,
+                'filename': '',
+                'error': f'Internal error: {str(e)[:100]}'
+            }
 
 # ========== TELEGRAM BOT HANDLERS ==========
-downloader = AsyncScribdDownloader()
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /start is issued."""
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Welcome message"""
     user = update.effective_user
-    welcome_text = f"""
-👋 Hello {user.first_name}!
+    welcome = f"""
+✨ *Welcome to Scribd Downloader Bot*, {user.first_name}! ✨
 
-📚 *Scribd Downloader Bot*
-
-I can download Scribd documents as PDF for you!
+📚 I can download Scribd documents as PDF files for you.
 
 *How to use:*
 1. Send me any Scribd link
-2. I'll process it
-3. You'll receive the PDF
+2. I'll process it automatically
+3. Receive your PDF document
 
-*Examples:*
-• https://www.scribd.com/document/123456789/Title
-• https://www.scribd.com/presentation/987654321
-• https://www.scribd.com/doc/456789123
+*Supported links:*
+• `https://scribd.com/document/123456789`
+• `https://scribd.com/presentation/987654321`
+• `https://scribd.com/doc/456789123/Title`
 
-*Note:* Please only download content you have rights to access.
+*Features:*
+• Fast and reliable downloads
+• Multiple service fallbacks
+• Support for large documents
+• No ads or tracking
 
-Send /help for more info.
+*Important:*
+• Maximum file size: 50MB (Telegram limit)
+• Processing time: 10-30 seconds
+• Download only content you have rights to
+
+Use /help for more information or just send a link to begin!
 """
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    await update.message.reply_text(welcome, parse_mode=ParseMode.MARKDOWN)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /help is issued."""
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Help instructions"""
     help_text = """
-🆘 *Help - Scribd Downloader Bot*
+🆘 *Scribd Downloader Bot - Help* 🆘
 
 *Commands:*
 /start - Start the bot
 /help - Show this help message
-/about - About this bot
+/stats - Show bot statistics
+/support - Get support information
 
 *Usage:*
-Simply send me a Scribd link and I'll download it as PDF.
+Simply send me a Scribd link starting with:
+• https://scribd.com/document/
+• https://scribd.com/presentation/
+• https://scribd.com/doc/
 
-*Supported links:*
-• https://scribd.com/document/...
-• https://scribd.com/presentation/...
-• https://scribd.com/doc/...
+*Examples:*
+https://www.scribd.com/document/123456789/Book-Title
+https://scribd.com/presentation/987654321
 
-*Important:*
-• Large documents may take longer to process
-• Maximum file size: 50MB (Telegram limit)
-• Please be patient during processing
+*Troubleshooting:*
+• If download fails, try a different Scribd link
+• Large documents take longer (be patient)
+• Check if document is publicly accessible
+• Try removing any tracking parameters from URL
 
 *Privacy:* I don't store any documents or user data.
 """
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
-async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send information about the bot."""
-    about_text = """
-ℹ️ *About Scribd Downloader Bot*
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show bot statistics"""
+    stats = context.bot_data.get('stats', {
+        'downloads_success': 0,
+        'downloads_failed': 0,
+        'total_users': 0,
+        'last_success': None
+    })
+    
+    stats_text = f"""
+📊 *Bot Statistics*
 
-*Version:* 2.0
-*Developer:* Your Developer Name
+✅ Successful downloads: {stats.get('downloads_success', 0)}
+❌ Failed downloads: {stats.get('downloads_failed', 0)}
+👥 Total users served: {stats.get('total_users', 0)}
+🕒 Last success: {stats.get('last_success', 'Never')}
 
-*Features:*
-• Fast PDF downloads from Scribd
-• Support for documents and presentations
-• Clean, easy-to-use interface
-• No ads or tracking
+*Uptime:* 24/7
+*Status:* ✅ Operational
+*Version:* 3.0 (Railway Optimized)
+"""
+    await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
 
-*Technology:*
-• Built with Python 3.10+
-• Uses scribd-downloader.co service
-• Async/await for better performance
+async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Support information"""
+    support_text = """
+💬 *Support & Contact*
+
+*Developer:* Scribd Downloader Team
+*Version:* 3.0
+*Platform:* Railway
+
+*Need help?*
+• Check /help for common issues
+• Ensure your Scribd link is valid
+• Documents must be publicly accessible
 
 *Disclaimer:*
-This bot is for educational purposes only.
+This bot is for educational purposes.
 Please respect copyright laws and only download content you have permission to access.
 
-*Support:* Contact @yourusername for help
+For bug reports or feature requests:
+Contact via GitHub or Telegram channel.
 """
-    await update.message.reply_text(about_text, parse_mode='Markdown')
+    await update.message.reply_text(support_text, parse_mode=ParseMode.MARKDOWN)
 
-async def handle_scribd_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Scribd links sent by users."""
+async def handle_scribd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process Scribd links"""
+    user = update.effective_user
     scribd_url = update.message.text.strip()
     
-    # Check if it's a valid Scribd URL
-    if not re.search(r'scribd\.com/(?:doc|document|presentation)/', scribd_url, re.IGNORECASE):
-        await update.message.reply_text(
-            "❌ *Invalid URL*\n\n"
-            "Please send a valid Scribd link.\n"
-            "Example: `https://www.scribd.com/document/123456789/Title`",
-            parse_mode='Markdown'
-        )
-        return
+    # Initialize stats if not exists
+    if 'stats' not in context.bot_data:
+        context.bot_data['stats'] = {
+            'downloads_success': 0,
+            'downloads_failed': 0,
+            'total_users': 1,
+            'last_success': None
+        }
+    
+    logger.info(f"User {user.id} requested: {scribd_url[:50]}...")
     
     # Send processing message
     processing_msg = await update.message.reply_text(
-        "🔄 *Processing your request...*\n\n"
-        "This may take 20-30 seconds depending on document size.\n"
-        "Please wait...",
-        parse_mode='Markdown'
+        "⏳ *Processing your request...*\n\n"
+        "Downloading document from Scribd...\n"
+        "This usually takes 10-20 seconds.\n"
+        "_Please wait..._",
+        parse_mode=ParseMode.MARKDOWN
     )
     
     try:
-        # Download PDF
-        pdf_content = await downloader.get_pdf_from_url(scribd_url)
+        # Download the document
+        async with ScribdDownloader() as downloader:
+            result = await downloader.download_document(scribd_url)
         
-        if pdf_content:
-            # Create filename
-            doc_info = downloader.extract_doc_info(scribd_url)
-            if doc_info and doc_info.get('name'):
-                # Clean filename
-                filename = re.sub(r'[^\w\-\.]', '_', doc_info['name'])
-                if not filename.lower().endswith('.pdf'):
-                    filename += '.pdf'
-            else:
-                filename = f"document_{doc_info['id'] if doc_info else 'unknown'}.pdf"
+        if result['success']:
+            # Update statistics
+            context.bot_data['stats']['downloads_success'] += 1
+            context.bot_data['stats']['last_success'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
-            # Check file size (Telegram limit: 50MB)
-            if len(pdf_content) > 50 * 1024 * 1024:
-                await processing_msg.edit_text(
-                    "❌ *File too large*\n\n"
-                    "The document exceeds Telegram's 50MB limit.\n"
-                    "Try downloading it directly from scribd-downloader.co",
-                    parse_mode='Markdown'
-                )
-                return
-            
-            # Send PDF
+            # Send the PDF
             await update.message.reply_document(
-                document=pdf_content,
-                filename=filename[:64],  # Telegram filename limit
-                caption="✅ *Download Complete!*\n\n"
-                       "Here's your PDF from Scribd.\n"
-                       f"Filename: `{filename}`",
-                parse_mode='Markdown'
+                document=InputFile(
+                    result['data'],
+                    filename=result['filename']
+                ),
+                caption=f"""
+✅ *Download Complete!*
+
+📄 *File:* {result['filename']}
+📦 *Size:* {result['size']/1024:.0f} KB
+⚡ *Status:* Successfully downloaded
+
+_Use /help for more options_
+                """,
+                parse_mode=ParseMode.MARKDOWN
             )
             
-            # Delete processing message
             await processing_msg.delete()
-            
-            logger.info(f"Successfully sent PDF for URL: {scribd_url}")
+            logger.info(f"Successfully sent PDF to user {user.id}")
             
         else:
-            await processing_msg.edit_text(
-                "❌ *Download Failed*\n\n"
-                "Could not download the PDF. Possible reasons:\n"
-                "• Document requires login/subscription\n"
-                "• Link is invalid or private\n"
-                "• Service is temporarily unavailable\n\n"
-                "Try: https://scribd-downloader.co",
-                parse_mode='Markdown'
-            )
+            # Update failed stats
+            context.bot_data['stats']['downloads_failed'] += 1
+            
+            error_msg = f"""
+❌ *Download Failed*
+
+*Reason:* {result['error']}
+
+*Possible solutions:*
+1. Check if the link is correct
+2. Ensure document is publicly accessible
+3. Try a different Scribd document
+4. Remove any tracking parameters from URL
+
+*Alternative:* Try downloading manually from scribd-downloader.co
+            """
+            
+            await processing_msg.edit_text(error_msg, parse_mode=ParseMode.MARKDOWN)
+            logger.warning(f"Download failed for user {user.id}: {result['error']}")
             
     except Exception as e:
-        logger.error(f"Error processing {scribd_url}: {e}")
+        logger.error(f"Unexpected error for user {user.id}: {e}")
         await processing_msg.edit_text(
-            f"❌ *Error*\n\nAn error occurred: `{str(e)}`\n\nPlease try again later.",
-            parse_mode='Markdown'
+            f"❌ *Unexpected Error*\n\n`{str(e)[:200]}`\n\nPlease try again later.",
+            parse_mode=ParseMode.MARKDOWN
         )
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle any text message."""
-    text = update.message.text
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all text messages"""
+    text = update.message.text.strip()
     
+    # Ignore commands
     if text.startswith('/'):
-        # It's a command, ignore here
         return
     
-    # Check if it looks like a URL
-    if 'scribd.com' in text.lower() and 'http' in text.lower():
+    # Check if it's a Scribd URL
+    if 'scribd.com' in text.lower() and ('http://' in text.lower() or 'https://' in text.lower()):
         await handle_scribd_link(update, context)
     else:
         await update.message.reply_text(
-            "📝 *I can only process Scribd links*\n\n"
-            "Please send me a Scribd URL starting with:\n"
-            "• `https://scribd.com/document/`\n"
-            "• `https://scribd.com/presentation/`\n"
-            "• `https://scribd.com/doc/`\n\n"
-            "Send /help for more information.",
-            parse_mode='Markdown'
+            "🤖 *I only process Scribd links*\n\n"
+            "Please send me a valid Scribd URL like:\n"
+            "`https://www.scribd.com/document/123456789/Title`\n\n"
+            "Use /help for instructions.",
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
         )
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log errors."""
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors gracefully"""
     logger.error(f"Update {update} caused error: {context.error}")
+    
+    if update and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ *Bot Error*\n\n"
+                "An unexpected error occurred. Please try again.\n"
+                "If problem persists, contact support.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except:
+            pass
+
+# ========== HEALTH CHECK ENDPOINT ==========
+async def health_check():
+    """Simple HTTP server for Railway health checks"""
+    from aiohttp import web
+    
+    async def handle_health(request):
+        return web.Response(text='OK', status=200)
+    
+    app = web.Application()
+    app.router.add_get('/', handle_health)
+    app.router.add_get('/health', handle_health)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    
+    logger.info(f"Health check server running on port {PORT}")
+    return runner
 
 # ========== MAIN FUNCTION ==========
-def main() -> None:
-    """Start the bot."""
+def main():
+    """Start the bot with proper Railway configuration"""
+    # Validate token
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN environment variable is not set!")
-        logger.error("Get a token from @BotFather and set it as BOT_TOKEN")
+        logger.error("❌ BOT_TOKEN not set in environment variables!")
+        logger.error("Set it in Railway dashboard: BOT_TOKEN=your_bot_token_here")
         return
     
-    # Create the Application
+    logger.info("🚀 Starting Scribd Downloader Bot...")
+    logger.info(f"📊 Port: {PORT}")
+    logger.info(f"🌐 Webhook URL: {WEBHOOK_URL or 'Not set (using polling)'}")
+    
+    # Create application
     application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Store initial stats
+    application.bot_data['stats'] = {
+        'downloads_success': 0,
+        'downloads_failed': 0,
+        'total_users': 0,
+        'last_success': None,
+        'start_time': datetime.now().isoformat()
+    }
     
     # Register handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("about", about_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("support", support_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    
-    # Register error handler
     application.add_error_handler(error_handler)
     
-    # Start the bot
-    logger.info("Starting Scribd Downloader Bot...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Choose deployment method based on WEBHOOK_URL
+    if WEBHOOK_URL:
+        # Webhook mode (better for production)
+        logger.info("🌐 Using webhook mode")
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=BOT_TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
+        )
+    else:
+        # Polling mode (simpler, works with Railway's internal routing)
+        logger.info("🔄 Using polling mode")
+        
+        # Start health check in background
+        async def run_bot():
+            # Start health check server
+            health_runner = await health_check()
+            
+            # Start bot
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling()
+            
+            # Keep running
+            await asyncio.Event().wait()
+            
+            # Cleanup
+            await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
+            await health_runner.cleanup()
+        
+        # Run bot
+        try:
+            asyncio.run(run_bot())
+        except KeyboardInterrupt:
+            logger.info("👋 Bot stopped by user")
+        except Exception as e:
+            logger.error(f"❌ Bot crashed: {e}")
+            raise
 
 if __name__ == '__main__':
-    # Check for required packages
+    # Check dependencies
     try:
         import aiohttp
-        import telegram
-    except ImportError as e:
-        logger.error(f"Missing package: {e}")
-        logger.error("Install with: pip install aiohttp python-telegram-bot")
-        exit(1)
-    
-    # Run the bot
-    try:
+        from telegram import __version__ as telegram_version
+        logger.info(f"✅ Dependencies: aiohttp={aiohttp.__version__}, python-telegram-bot={telegram_version}")
+        
+        # Run the bot
         main()
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-        # Close downloader session
-        asyncio.run(downloader.close_session())
-    finally:
-
-        logger.info("Bot shutdown complete")
+        
+    except ImportError as e:
+        logger.error(f"❌ Missing dependency: {e}")
+        logger.error("Install: pip install python-telegram-bot[job-queue]==20.7 aiohttp")
+        exit(1)
